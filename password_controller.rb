@@ -10,7 +10,7 @@ class Portal::PasswordController < PortalController
   def index
     if logged_in?
       # User is already authenticated, check if password needs to be changed
-      if @current_account.scratch&.include?('password_change_required')
+      if account_needs_password_change?(@current_account)
         render_portal_partial('password_change_form')
       else
         # Password already changed, redirect to main portal
@@ -20,6 +20,37 @@ class Portal::PasswordController < PortalController
       # Show login form for password change
       render_portal_partial('password_change_login')
     end
+  end
+
+  # Handle token-based account setup auto-login
+  def account_setup
+    token = params[:token]
+    
+    # Validate token exists
+    if token.blank?
+      flash[:error] = :invalid_or_missing_token
+      redirect_to action: :index
+      return
+    end
+
+    # Find account by token
+    account = find_account_by_token(token)
+    
+    if account.nil?
+      flash[:error] = :invalid_or_expired_token
+      redirect_to action: :index
+      return
+    end
+
+    # Auto-login the user
+    self.login_session = login_session_for_account(account)
+    
+    # Clear the token (single-use security)
+    clear_account_setup_token(account)
+    
+    # Redirect to password change form with success message
+    flash[:success] = :auto_login_successful
+    redirect_to action: :index
   end
 
   # Handle password change submission
@@ -50,7 +81,7 @@ class Portal::PasswordController < PortalController
     end
 
     # Verify old password if this is a password change (not initial setup)
-    unless @current_account.scratch&.include?('initial_password_setup')
+    unless is_initial_password_setup?(@current_account)
       unless @current_account.authenticate(old_password)
         flash.now[:error] = :invalid_current_password
         render_portal_partial('password_change_form')
@@ -60,10 +91,12 @@ class Portal::PasswordController < PortalController
 
     # Update the password
     begin
+      # Clear password change requirement from scratch field
+      clear_password_change_requirement(@current_account)
+      
       @current_account.update!(
         password: new_password,
-        password_confirmation: new_password,
-        scratch: nil  # Clear the password change requirement flag
+        password_confirmation: new_password
       )
 
       # Move user to active tenant group
@@ -99,6 +132,139 @@ class Portal::PasswordController < PortalController
   def redirect_to_main_portal
     # Redirect to the main Fairmont portal
     redirect_to "#{request.protocol}#{request.host}/portal/fairmanage/"
+  end
+
+  def account_needs_password_change?(account)
+    return false unless account.scratch.present?
+    
+    # Check if scratch contains password_change_required flag
+    if account.scratch.include?('password_change_required')
+      return true
+    end
+    
+    # Also check YAML parsed data for more structured approach
+    begin
+      data = YAML.load(account.scratch)
+      return false unless data.is_a?(Hash)
+      return !!(data[:password_change_required] || data['password_change_required'])
+    rescue
+      return false
+    end
+  end
+
+  def is_initial_password_setup?(account)
+    return false unless account.scratch.present?
+    
+    # Check if this is initial setup (no old password verification needed)
+    if account.scratch.include?('initial_password_setup')
+      return true
+    end
+    
+    # For token-based setup, consider it initial setup
+    begin
+      data = YAML.load(account.scratch)
+      return false unless data.is_a?(Hash)
+      return !!(data[:initial_password_setup] || data['initial_password_setup'] || 
+                data[:auto_login_token] || data['auto_login_token'])
+    rescue
+      return false
+    end
+  end
+
+  def clear_password_change_requirement(account)
+    return unless account.scratch.present?
+    
+    begin
+      data = YAML.load(account.scratch)
+      data = {} unless data.is_a?(Hash)
+    rescue
+      data = {}
+    end
+    
+    # Remove password change requirement flags
+    data.delete(:password_change_required)
+    data.delete('password_change_required')
+    data.delete(:initial_password_setup)
+    data.delete('initial_password_setup')
+    
+    # Update scratch field
+    if data.empty?
+      account.scratch = nil
+    else
+      account.scratch = data.to_yaml
+    end
+    
+    account.save!
+  end
+
+  def find_account_by_token(token)
+    # Search through all accounts to find matching token
+    Account.all.find do |account|
+      next unless account.scratch.present?
+      
+      # Parse YAML data from scratch field
+      begin
+        data = YAML.load(account.scratch)
+        data = {} unless data.is_a?(Hash)
+      rescue
+        data = {}
+      end
+      
+      # Check both string and symbol keys for compatibility
+      stored_token = data[:auto_login_token] || data['auto_login_token']
+      expires_at = data[:token_expires_at] || data['token_expires_at']
+      
+      if stored_token == token
+        # Check if token is still valid (not expired)
+        if expires_at
+          begin
+            expiry_time = expires_at.is_a?(String) ? Time.parse(expires_at) : expires_at
+            if expiry_time > Time.now
+              return account
+            else
+              # Token expired, clear it
+              clear_account_setup_token(account)
+            end
+          rescue
+            # Invalid expiry date, treat as expired
+            clear_account_setup_token(account)
+          end
+        end
+      end
+    end
+    nil
+  end
+
+  def clear_account_setup_token(account)
+    return unless account.scratch.present?
+    
+    # Parse existing scratch data
+    begin
+      data = YAML.load(account.scratch)
+      data = {} unless data.is_a?(Hash)
+    rescue
+      data = {}
+    end
+    
+    # Remove token-related keys (both string and symbol versions)
+    data.delete(:auto_login_token)
+    data.delete('auto_login_token')
+    data.delete(:token_expires_at)
+    data.delete('token_expires_at')
+    
+    # Update scratch field - set to nil if empty, otherwise save updated YAML
+    if data.empty?
+      account.scratch = nil
+    else
+      account.scratch = data.to_yaml
+    end
+    
+    begin
+      account.save!
+      Rails.logger.info "Cleared account setup token for account #{account.login}"
+    rescue => e
+      Rails.logger.error "Failed to clear token for account #{account.login}: #{e.message}"
+    end
   end
 
 end
