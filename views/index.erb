@@ -1,0 +1,23 @@
+<% if @logged_in %>
+  <% if @current_account.scratch&.include?('password_change_required') %>
+    <%= render_portal_partial 'password_change_form' %>
+  <% else %>
+    <!-- Password already changed, redirect to main portal -->
+    <div class="container-fluid vh-100 d-flex align-items-center justify-content-center">
+      <div class="text-center">
+        <div class="spinner-border text-primary" role="status">
+          <span class="visually-hidden">Redirecting...</span>
+        </div>
+        <h4 class="mt-3">Setup Complete!</h4>
+        <p>Redirecting you to the main portal...</p>
+      </div>
+    </div>
+    <script>
+      setTimeout(function() {
+        window.location.href = '<%= "#{request.protocol}#{request.host}/portal/fairmanage/" %>';
+      }, 2000);
+    </script>
+  <% end %>
+<% else %>
+  <%= render_portal_partial 'password_change_login' %>
+<% end %>
